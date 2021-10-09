@@ -1,0 +1,41 @@
+version: "3"
+services:
+  db:
+    build: ./mysql
+    volumes:
+      - ./mysql/db:/docker-entrypoint-initdb.d #world.aqlをぶちこむ
+    image: local_mysql
+    environment:
+      - MYSQL_ROOT_PASSWORD=password
+      # - MYSQL_ROOT_USERNAME=world
+      # - MYSQL_ROOT_HOSTNAME=world
+      # - MYSQL_ROOT_PORT=4000
+      # - MYSQL_ROOT_DATABASE=world
+    ports:
+      - "3306:3306"
+
+
+  phpmyadmin:
+    image: phpmyadmin/phpmyadmin
+    environment:
+      - PMA_ARBITRARY=1
+      - PMA_HOST=db
+      - PMA_USER=root
+      - PMA_PASSWORD=password
+    links:
+      - db
+    ports:
+      - 4040:80
+    volumes:
+      - ./phpmyadmin/sessions:/sessions
+  
+  app: # service名
+    build: . # ビルドに使用するDockerfileがあるディレクトリ指定
+    tty: true # コンテナの起動永続化
+    volumes:
+      - .:/go/src/work # マウントディレクトリ指定
+    depends_on: 
+      - db
+    ports: # ホストOSのポートとコンテナのポートをつなげる 
+      - "8080:8080"
+
