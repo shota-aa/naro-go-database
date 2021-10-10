@@ -1,16 +1,17 @@
 package main
 
 import (
-	"context"
-	"database/sql"
-	"errors"
 	"fmt"
 	"log"
 	"net/http"
 
 	_ "github.com/go-sql-driver/mysql"
 	"github.com/jmoiron/sqlx"
-	"github.com/labstack/echo"
+	"github.com/labstack/echo-contrib/session"
+	"github.com/labstack/echo/v4"
+	"github.com/labstack/echo/v4/middleware"
+	"github.com/srinathgs/mysqlstore"
+	"golang.org/x/crypto/bcrypt"
 )
 
 type City struct {
@@ -32,56 +33,130 @@ func main() {
 	}
 	db = _db
 
-	fmt.Println("Connected!")
-	var city City
-	if err := db.Get(&city, "SELECT * FROM city WHERE Name='Tokyo'"); errors.Is(err, sql.ErrNoRows) {
-		log.Printf("no such city Name = %s", "Tokyo")
-	} else if err != nil {
-		log.Fatalf("DB Error: %s", err)
+	store, err := mysqlstore.NewMySQLStoreFromConnection(db.DB, "sessions", "/", 60*60*24*14, []byte("secret-token"))
+	if err != nil {
+		panic(err)
 	}
-	fmt.Printf("Tokyoの人口は%d人です\n", city.Population)
-
-	// cities := []City{}
-	// db.Select(&cities, "SELECT * FROM city WHERE CountryCode='JPN'")
-	// fmt.Println("日本の都市一覧")
-	// for _, city := range cities {
-	// 	fmt.Printf("都市名: %s, 人口: %d人\n", city.Name, city.Population)
-	// }
 	e := echo.New()
+	e.Use(middleware.Logger())
+	e.Use(session.Middleware(store))
 
-	e.GET("/cities/:cityName", getCityInfoHandler)
-	e.POST("/cities", postCityInfoHandler)
+	e.GET("/ping", func(c echo.Context) error {
+		return c.String(http.StatusOK, "pong")
+	})
+	e.POST("/login", postLoginHandler)
+	e.POST("/signup", postSignUpHander)
 
+	withlogin := e.Group("")
+	withlogin.Use(checkLogin)
+	withlogin.GET("/cities/:cityName", getCityInfoHandler)
+	withlogin.GET("/user", getLoginUserHandler)
 	e.Start(":8080")
+}
+
+type LoginRequestBody struct {
+	Username string `json:"username,omitempty" form:"username"`
+	Password string `json:"password,omitempty" form:"password"`
+}
+
+type User struct {
+	Username   string `json:"username,omitempty" db:"Username"`
+	HashedPass string `json:"-" db:"HashedPass"`
+}
+
+func postSignUpHander(c echo.Context) error {
+	var req LoginRequestBody
+	c.Bind(&req)
+
+	if req.Password == "" || req.Username == "" {
+		return c.String(http.StatusBadRequest, "項目が空です")
+	}
+
+	hashedPass, err := bcrypt.GenerateFromPassword([]byte(req.Password), bcrypt.DefaultCost)
+	if err != nil {
+		return c.String(http.StatusInternalServerError, fmt.Sprintf("bcrypt generate error: %v", err))
+	}
+
+	var count int
+
+	err = db.Get(&count, "SELECT COUNT(*) FROM users WHERE Username=?", req.Username)
+	if err != nil {
+		return c.String(http.StatusInternalServerError, fmt.Sprintf("db error: %v", err))
+	}
+
+	if count > 0 {
+		return c.String(http.StatusConflict, "ユーザーが既に存在しています")
+	}
+
+	_, err = db.Exec("INSERT INTO users (Username, HashedPass) VALUES (?, ?)", req.Username, hashedPass)
+	if err != nil {
+		return c.String(http.StatusInternalServerError, fmt.Sprintf("db error: %v", err))
+	}
+	return c.NoContent(http.StatusCreated)
+}
+func postLoginHandler(c echo.Context) error {
+	var req LoginRequestBody
+	c.Bind(&req)
+
+	var user User
+	err := db.Get(&user, "SELECT * FROM users WHERE username=?", req.Username)
+	if err != nil {
+		return c.String(http.StatusInternalServerError, fmt.Sprintf("db error: %v", err))
+	}
+	err = bcrypt.CompareHashAndPassword([]byte(user.HashedPass), []byte(req.Password))
+	if err != nil {
+		if err == bcrypt.ErrMismatchedHashAndPassword {
+			return c.NoContent(http.StatusForbidden)
+		} else {
+			return c.NoContent(http.StatusInternalServerError)
+		}
+	}
+
+	sess, err := session.Get("sessions", c)
+	if err != nil {
+		panic(err)
+	}
+	sess.Values["userName"] = req.Username
+	sess.Save(c.Request(), c.Response())
+
+	return c.NoContent(http.StatusOK)
+}
+
+func checkLogin(next echo.HandlerFunc) echo.HandlerFunc {
+	return func(c echo.Context) error {
+		sess, err := session.Get("sessions", c) //headerからとっている？
+		if err != nil {
+			fmt.Println(err)
+			return c.String(http.StatusInternalServerError, "something wrong in getting session")
+		}
+
+		if sess.Values["userName"] == nil {
+			return c.String(http.StatusForbidden, "please login")
+		}
+		c.Set("userName", sess.Values["userName"].(string))
+
+		return next(c)
+	}
 }
 
 func getCityInfoHandler(c echo.Context) error {
 	cityName := c.Param("cityName")
-	fmt.Println(cityName)
 
 	var city City
-	if err := db.Get(&city, "SELECT * FROM city WHERE Name=?", cityName); errors.Is(err, sql.ErrNoRows) {
-		log.Printf("No Such City Name=%s", cityName)
-	} else if err != nil {
-		log.Fatalf("DB Error: %s", err)
+	db.Get(&city, "SELECT * FROM city WHERE Name=?", cityName)
+	if city.Name == "" {
+		return c.NoContent(http.StatusNotFound)
 	}
 
 	return c.JSON(http.StatusOK, city)
 }
 
-func postCityInfoHandler(c echo.Context) error {
-	var city City
-	if err := c.Bind(&city); err != nil {
-		c.Logger().Error(err)
-		return echo.NewHTTPError(http.StatusBadRequest, err)
+func getLoginUserHandler(c echo.Context) error {
+	var username string
+	username, ok := c.Get("userName").(string)
+	if !ok || username == "" {
+		return c.String(http.StatusForbidden, "please login")
 	}
 
-	ctx := context.Background()
-	_, err := db.ExecContext(ctx, "INSERT INTO `city` VALUES (?,?,?,?,?)", city.ID, city.Name, city.CountryCode, city.District, city.Population) 
-  if err != nil {
-		c.Logger().Error(err)
-		return echo.NewHTTPError(http.StatusBadRequest, err)
-	}
-
-	return c.JSON(http.StatusOK, city)
+	return c.JSON(http.StatusOK, username)
 }
